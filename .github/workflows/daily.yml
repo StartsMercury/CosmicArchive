@@ -1,14 +1,20 @@
+name: "Daily Check"
 on:
   schedule:
     - cron: "0 0 * * 0"
   workflow_dispatch:
+env:
+  RUST_LOG: info
 
 jobs:
   get:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: clechasseur/rs-cargo@v2
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Set-up Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Cargo Run
+        uses: clechasseur/rs-cargo@v2
         with:
           command: run
