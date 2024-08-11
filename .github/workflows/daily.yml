@@ -26,5 +26,5 @@ jobs:
         uses: clechasseur/rs-cargo@v2
         continue-on-error: true
         with:
-          command: build
+          command: run
           args: --release
