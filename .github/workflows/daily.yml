@@ -7,8 +7,8 @@ env:
   RUST_LOG: info
 
 jobs:
-  build:
-    name: Build Updater
+  run:
+    name: Run Updater
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -22,14 +22,9 @@ jobs:
         with:
           command: build
           args: --release
-  run:
-    name: Run Updater
-    needs: build
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    steps:
       - name: Cargo Run
         uses: clechasseur/rs-cargo@v2
+        continue-on-error: true
         with:
-          command: run
+          command: build
           args: --release
