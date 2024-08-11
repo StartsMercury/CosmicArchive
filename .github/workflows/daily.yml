@@ -14,7 +14,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
       - name: Set-up Rust Toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        run: rustup toolchain install stable --profile minimal
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Cargo Build
