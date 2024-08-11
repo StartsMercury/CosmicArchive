@@ -1,38 +1,33 @@
-use derive_new::new;
 use hex::FromHexError;
 use itertools::Itertools;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use once_cell::sync::Lazy;
-use sha2::digest::DynDigest;
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
-use std::fmt::Formatter;
 use std::fs::File;
-use std::io::Cursor;
+use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::{fmt, ops};
-use tokio::io::{stdout, AsyncWriteExt};
-use tokio::task::JoinSet;
-use tokio::try_join;
-use url::Url;
-use zip::ZipArchive;
+use std::process::ExitCode;
+use std::{fmt, io, ops, str};
 
-const COSMIC_ARCHIVE_VERSIONS_URL: &str =
+const ARCHIVED_VERSIONS_URL: &str =
     "https://raw.githubusercontent.com/CRModders/CosmicArchive/main/versions.json";
 
-const COSMIC_REACH_URL: &str = "https://finalforeach.itch.io/cosmic-reach";
+const ITCH_GAME_URL: &str = "https://finalforeach.itch.io/cosmic-reach";
+
+const TARGET_DOWNLOAD_TITLE: &str = "cosmic-reach-jar.zip";
 
 static CSRF_TOKEN: Lazy<String> = Lazy::new(|| std::env::var("CSRF_TOKEN").unwrap_or_default());
 
-macro_rules! is_jar_platform {
-    ($it:expr) => {
-        $it.contains(&::itch_io::Platform::Linux) && $it.contains(&::itch_io::Platform::Windows)
-    };
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(()) => ExitCode::FAILURE,
+    }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), ()> {
+async fn run() -> Result<(), ()> {
     env_logger::init();
 
     if CSRF_TOKEN.is_empty() {
@@ -40,49 +35,28 @@ async fn main() -> Result<(), ()> {
     }
 
     let client = itch_io::Client::new();
-    let join_set = get_game_jars(&client);
+    let download_id = get_jar_download_id(&client);
     let archived_hashes = get_version_hashes(&client);
 
-    let (mut join_set, archived_hashes) = try_join!(join_set, archived_hashes)?;
+    let download_id = download_id.await?;
+    // TODO: only download and check hash if git branch does not yet exist
+    let path = download_with_id(&client, download_id);
 
-    let mut hasher = {
-        use sha2::Digest;
-        sha2::Sha256::new()
-    };
-    let mut paths = Vec::new();
+    let (path, archived_hashes) = tokio::try_join!(path, archived_hashes)?;
 
-    while let Some(res) = join_set.join_next().await {
-        match res {
-            Ok(Ok(files)) => {
-                for path in files {
-                    if is_version_unarchived(&archived_hashes, &mut hasher, &path) {
-                        paths.push(path);
-                    }
-                }
-            }
-            Ok(Err(())) => {}
-            Err(cause) => error!("Unexpected join error: {cause}"),
-        };
-    }
-
-    // NOTE: most of the time will print none when the latest is archived; and
-    //       one when the current latest is not yet archived.
-    if paths.is_empty() {
-        warn!("NO JAR files found whose hashes are NOT already in the archive");
+    if is_version_unarchived(&archived_hashes, &path) {
+        warn!("Printing to STDOUT the JAR path that is NOT yet archived.");
+        println!("{}", path.display());
+        Ok(())
     } else {
-        warn!("Following are downloaded game JAR files whose hashes are not found in the archive:");
-        for path in paths {
-            println!("{}", path.display());
-        }
+        error!("'{}' is already archived", path.display());
+        Err(())
     }
-
-    Ok(())
 }
 
 async fn get_version_hashes(client: &itch_io::Client) -> Result<HashSet<Sha256Hash>, ()> {
-    info!("Sending GET request to archived versions data...");
-    debug!("GET request {COSMIC_ARCHIVE_VERSIONS_URL}");
-    let versions_response = match client.client.get(COSMIC_ARCHIVE_VERSIONS_URL).send().await {
+    warn!("Sending GET request to archived versions data ({ARCHIVED_VERSIONS_URL})...");
+    let versions_response = match client.client.get(ARCHIVED_VERSIONS_URL).send().await {
         Ok(it) => it,
         Err(cause) => {
             error!("Failed to send GET request for archived versions data: {cause}");
@@ -98,11 +72,11 @@ async fn get_version_hashes(client: &itch_io::Client) -> Result<HashSet<Sha256Ha
         return Err(());
     }
 
-    info!("Reading bytes from GET response...");
+    info!("Reading bytes from GET response to archived versions data...");
     let versions_bytes = match versions_response.bytes().await {
         Ok(it) => it,
         Err(cause) => {
-            error!("Failed to read bytes from GET response: {cause}");
+            error!("Failed to read bytes from GET response to archived versions data: {cause}");
             error!("This usually happens with unstable connection from either end");
             return Err(());
         }
@@ -115,7 +89,7 @@ async fn get_version_hashes(client: &itch_io::Client) -> Result<HashSet<Sha256Ha
             error!("Failed to deserialize received bytes as valid JSON: {cause})");
 
             error!("Dumping bytes to STDOUT...");
-            if let Err(cause) = stdout().write_all(&versions_bytes).await {
+            if let Err(cause) = stdout().write_all(&versions_bytes) {
                 error!("Failed to bump the bytes: {cause}");
             }
 
@@ -126,59 +100,74 @@ async fn get_version_hashes(client: &itch_io::Client) -> Result<HashSet<Sha256Ha
     let hashes = versions.versions.into_iter().map(|it| it.sha256).collect();
     info!("Collected known game jar sha256 hashes");
     for hash in &hashes {
-        debug!("        {hash}");
+        info!("        {hash}");
     }
 
     Ok(hashes)
 }
 
-async fn get_game_jars(client: &itch_io::Client) -> Result<JoinSet<Result<Vec<PathBuf>, ()>>, ()> {
-    info!("Getting game page data...");
-    debug!("Getting game page data for {COSMIC_REACH_URL}...");
-    let download_ids = match client.get_game_page(COSMIC_REACH_URL).await {
-        Ok(game_page) => {
-            let download_ids = game_page.downloads.into_iter().filter_map(|download| {
-                let id = download.id?;
-                is_jar_platform!(download.platforms).then_some(id)
-            });
-            info!("Collected likely JAR containing version download ids");
-            download_ids.collect_vec()
-        }
+async fn get_jar_download_id(client: &itch_io::Client) -> Result<u64, ()> {
+    warn!("Getting game page data of {ITCH_GAME_URL}...");
+    let game_page = match client.get_game_page(ITCH_GAME_URL).await {
+        Ok(it) => it,
         Err(cause) => {
             error!("Failed getting game page data: {cause}");
             return Err(());
         }
     };
 
-    let join_set = download_ids
-        .into_iter()
-        .map(|download_id| {
-            let client = client.clone();
-            async move { download_game_jars(client, download_id).await }
-        })
-        .collect();
-    Ok(join_set)
-}
+    info!("Following are available downloads:");
+    for download in &game_page.downloads {
+        info!("        {}", download.title);
+    }
 
-async fn download_game_jars(client: itch_io::Client, download_id: u64) -> Result<Vec<PathBuf>, ()> {
-    info!("[{download_id}] Getting download info");
-    let url = match client
-        .get_download_info(COSMIC_REACH_URL, download_id, &CSRF_TOKEN)
-        .await
+    let jar_download = match game_page
+        .downloads
+        .into_iter()
+        .filter(|download| matches!(download.title.as_str(), TARGET_DOWNLOAD_TITLE))
+        .at_most_one()
     {
-        Ok(it) => it.url,
-        Err(cause) => {
-            error!("[{download_id}] Failed getting download info: {cause}");
+        Ok(None) => {
+            error!("NO download options matched `{TARGET_DOWNLOAD_TITLE}`");
+            return Err(());
+        }
+        Ok(Some(it)) => it,
+        Err(downloads) => {
+            error!("There is more than one '{TARGET_DOWNLOAD_TITLE}':");
+            for download in downloads {
+                error!("        {download:?}");
+            }
             return Err(());
         }
     };
 
-    info!("[{download_id}] Sending GET request to download url...");
-    debug!("[{download_id}] GET request {url}");
+    jar_download.id.map_or_else(
+        || {
+            error!("Jar download option has NO id");
+            Err(())
+        },
+        Ok,
+    )
+}
+
+async fn download_with_id(client: &itch_io::Client, download_id: u64) -> Result<PathBuf, ()> {
+    info!("Getting download info");
+    let url = match client
+        .get_download_info(ITCH_GAME_URL, download_id, &CSRF_TOKEN)
+        .await
+    {
+        Ok(it) => it.url,
+        Err(cause) => {
+            error!("Failed getting download info: {cause}");
+            return Err(());
+        }
+    };
+
+    warn!("Sending GET request to download url ({ARCHIVED_VERSIONS_URL})...");
     let response = match client.client.get(url).send().await {
         Ok(it) => it,
         Err(cause) => {
-            error!("[{download_id}] Failed to send GET request to download url: {cause}");
+            error!("Failed to send GET request to download url: {cause}");
             return Err(());
         }
     };
@@ -188,133 +177,118 @@ async fn download_game_jars(client: itch_io::Client, download_id: u64) -> Result
         return Err(());
     }
 
-    info!("[{download_id}] Reading bytes from GET response...");
+    info!("Reading bytes from GET response to download url...");
     let bytes = match response.bytes().await {
         Ok(it) => it,
         Err(cause) => {
-            error!("[{download_id}] Failed to read bytes from GET response: {cause}");
-            error!("[{download_id}] This usually happens with unstable connection from either end");
+            error!("Failed to read bytes from GET response to download url: {cause}");
+            error!("This usually happens with unstable connection from either end");
             return Err(());
         }
     };
 
-    let path = PathBuf::from(download_id.to_string());
-
-    info!("[{download_id}] Creating destination folder for extraction...");
-    debug!("[{download_id}] {}", path.display());
-    if let Err(cause) = std::fs::create_dir(&path) {
-        if cause.kind() == std::io::ErrorKind::AlreadyExists {
-            info!("[{download_id}] Destination directory already exists");
-        } else {
-            error!("[{download_id}] Failed to create destination folder for extraction: {cause}");
-            return Err(());
-        }
-    };
-
-    info!("[{download_id}] Reading bytes as zip archive...");
-    let mut archive = match ZipArchive::new(Cursor::new(bytes)) {
+    info!("Reading bytes as zip archive...");
+    let mut archive = match zip::ZipArchive::new(io::Cursor::new(bytes)) {
         Ok(it) => it,
         Err(cause) => {
-            error!("[{download_id}] Failed to read bytes as zip archive: {cause}");
+            error!("Failed to read bytes as zip archive: {cause}");
             return Err(());
         }
     };
 
-    let paths = (0..archive.len()).filter_map(|archive_id| {
-        error!("[{download_id}] Accessing archived file at index {archive_id}...");
-        let mut file = match archive.by_index(archive_id) {
-            Ok(it) => it,
-            Err(cause) => {
-                error!("[{download_id}] Unable to access archived file at index {archive_id}: {cause}");
-                return None;
-            }
-        };
+    info!("Archive contains the following files:");
+    for file_name in archive.file_names() {
+        info!("    {file_name}");
+    }
 
-        let relative_path = file.mangled_name();
-        if let Some(file_name) = relative_path.file_name().and_then(OsStr::to_str) {
-            if file_name.starts_with("Cosmic Reach-")
-                && relative_path
-                .extension()
-                .map_or(false, |ext| ext.eq_ignore_ascii_case("jar"))
-            {
-                info!("[{download_id}] ({archive_id}) Found game jar file {}", relative_path.display());
-                let extracted_path = path.join(&relative_path);
-
-                info!("[{download_id}] ({archive_id}) Creating destination game jar file if absent...");
-                let mut extracted = match File::create(&extracted_path) {
-                    Ok(it) => it,
-                    Err(cause) => {
-                        error!("[{download_id}] ({archive_id}) Failed to create destination game jar file: {cause}");
-                        return None;
-                    }
-                };
-
-                info!("[{download_id}] ({archive_id}) Extracting extract game jar file...");
-                return if let Err(cause) = std::io::copy(&mut file, &mut extracted) {
-                    error!("[{download_id}] ({archive_id}) Failed to extract game jar file: {cause}");
-                    None
-                } else {
-                    Some(extracted_path)
-                }
-            }
+    let file_name = match archive
+        .file_names()
+        .filter(|file_name| {
+            file_name.starts_with("Cosmic Reach-")
+                || Path::extension(file_name.as_ref())
+                    .map_or(false, |it| it.eq_ignore_ascii_case("jar"))
+        })
+        .at_most_one()
+    {
+        Ok(None) => {
+            error!("Archive did NOT contain the game JAR");
+            return Err(());
         }
+        Ok(Some(it)) => {
+            info!("Found game JAR: {it}");
+            String::from(it)
+        }
+        Err(file_names) => {
+            error!("Archived contained MULTIPLE game JARs:");
+            for file_name in file_names {
+                error!("        {file_name}");
+            }
+            return Err(());
+        }
+    };
 
-        debug!("[{download_id}] ({archive_id}) Ignored non-game jar file {}", relative_path.display());
-        None
-    }).collect_vec();
-
-    Ok(paths)
-}
-
-fn is_version_unarchived<P: AsRef<Path>>(
-    archived_hashes: &HashSet<Sha256Hash>,
-    hasher: &mut sha2::Sha256,
-    path: P,
-) -> bool {
-    let path = path.as_ref();
-
-    info!(
-        "[{}] Opening file before hash calculation...",
-        path.display()
-    );
-    let mut file = match File::open(path) {
+    info!("Reading archived game jar...");
+    let mut file = match archive.by_name(&file_name) {
         Ok(it) => it,
         Err(cause) => {
             error!(
-                "[{}] Failed to open file for hash calculations: {cause}",
-                path.display()
+                "Previously accessed archived file is no longer accessible '{file_name}': {cause}"
             );
+            return Err(());
+        }
+    };
+
+    // NOTE: might as well stay in the safety of ZipFile::mangled_name
+    let relative_path = file.mangled_name();
+
+    info!("Creating destination game jar file if absent...");
+    let mut extracted = match File::create(&relative_path) {
+        Ok(it) => it,
+        Err(cause) => {
+            error!("Failed to create destination game jar file: {cause}");
+            return Err(());
+        }
+    };
+
+    info!("Extracting extract game jar file...");
+    if let Err(cause) = std::io::copy(&mut file, &mut extracted) {
+        error!("Failed copy archived game jar contents to destination file: {cause}");
+        Err(())
+    } else {
+        Ok(relative_path)
+    }
+}
+
+fn is_version_unarchived<P: AsRef<Path>>(archived_hashes: &HashSet<Sha256Hash>, path: P) -> bool {
+    let path = path.as_ref();
+
+    let mut hasher = sha2::Sha256::new();
+
+    info!("Opening file before hash calculation...");
+    let mut file = match File::open(path) {
+        Ok(it) => it,
+        Err(cause) => {
+            error!("Failed to open file for hash calculations: {cause}");
             return false;
         }
     };
 
-    info!("[{}] Calculating sha256 hash...", path.display());
-    if let Err(cause) = std::io::copy(&mut file, hasher) {
-        error!(
-            "[{}] Failed to calculate sha256 hash: {cause}",
-            path.display()
-        );
+    info!("Calculating sha256 hash...");
+    if let Err(cause) = std::io::copy(&mut file, &mut hasher) {
+        error!("Failed to calculate sha256 hash: {cause}");
         return false;
     }
 
-    info!("[{}] Generating sha256 hash...", path.display());
+    info!("Generating sha256 hash...");
     let mut hash = Sha256Hash::default();
-    if let Err(cause) = hasher.finalize_into_reset(&mut hash) {
-        error!(
-            "[{}] Failed to generate sha256 hash: {cause}",
-            path.display()
-        );
+    if let Err(cause) = sha2::digest::DynDigest::finalize_into(hasher, &mut hash) {
+        error!("Failed to generate sha256 hash: {cause}");
         error!("[FATAL] This is likely a logic bug concerning incorrect byte buffer size");
         return false;
     };
-    debug!("[{}] {hash}", path.display());
+    info!("Game JAR hash: {hash}");
 
-    if archived_hashes.contains(&hash) {
-        warn!("[{}] Sha256 already archived, skipping", path.display());
-        false
-    } else {
-        true
-    }
+    !archived_hashes.contains(&hash)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -330,7 +304,7 @@ struct Version {
     pub kind: String,
     #[serde(rename = "releaseTime")]
     pub release_time: u64,
-    pub url: Url,
+    pub url: url::Url,
     pub sha256: Sha256Hash,
     pub size: u64,
 }
@@ -342,10 +316,10 @@ struct Version {
     Default,
     Eq,
     Hash,
-    new,
     Ord,
     PartialEq,
     PartialOrd,
+    derive_new::new,
     serde::Deserialize,
     serde::Serialize,
 )]
@@ -400,17 +374,6 @@ impl From<Sha256Hash> for String {
     }
 }
 
-impl FromStr for Sha256Hash {
-    type Err = FromHexError;
-
-    #[inline]
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut array = [0; 32];
-        hex::decode_to_slice(s, &mut array)?;
-        Ok(Self::new(array))
-    }
-}
-
 impl TryFrom<String> for Sha256Hash {
     type Error = FromHexError;
 
@@ -424,7 +387,7 @@ impl TryFrom<String> for Sha256Hash {
 
 impl fmt::Display for Sha256Hash {
     #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self))
     }
 }
@@ -442,5 +405,16 @@ impl ops::DerefMut for Sha256Hash {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+impl str::FromStr for Sha256Hash {
+    type Err = FromHexError;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut array = [0; 32];
+        hex::decode_to_slice(s, &mut array)?;
+        Ok(Self::new(array))
     }
 }
