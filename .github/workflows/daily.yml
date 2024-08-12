@@ -23,8 +23,5 @@ jobs:
           command: build
           args: --release
       - name: Cargo Run
-        uses: clechasseur/rs-cargo@v2
+        run: target/release/cosmicarchive-updater
         continue-on-error: true
-        with:
-          command: run
-          args: --release
