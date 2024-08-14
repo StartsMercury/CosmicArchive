@@ -6,6 +6,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_LOG: info
+  RUST_LOG_STYLE: always
 
 jobs:
   run:
