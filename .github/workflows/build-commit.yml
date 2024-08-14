@@ -1,0 +1,23 @@
+name: build-commit
+on: [ push ]
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+  RUST_LOG_STYLE: always
+
+jobs:
+  run:
+    name: Run Updater
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Set-up Rust Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Cargo Build
+        uses: clechasseur/rs-cargo@v2
+        with:
+          command: build
+          args: --release
