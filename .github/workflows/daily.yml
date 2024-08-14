@@ -19,11 +19,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
-      - name: Cargo Build
+      - name: Cargo Run
         uses: clechasseur/rs-cargo@v2
         with:
-          command: build
+          command: run
           args: --release
-      - name: Cargo Run
-        run: target/release/cosmicarchive-updater
-        continue-on-error: true
