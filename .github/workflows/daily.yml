@@ -17,6 +17,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+      - name: Cargo Colored Output
+        run: echo CARGO_TERM_COLOR=always >> $GITHUB_ENV
       - name: Cargo Build
         uses: clechasseur/rs-cargo@v2
         with:
